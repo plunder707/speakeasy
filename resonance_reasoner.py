@@ -162,7 +162,7 @@ class ResonanceReasoner:
                 if not aborted:
                     # Apply self-critique if enabled
                     if self.enable_critique:
-                        critique_result = self._self_critique(attempt.response, query)
+                        critique_result = await self._self_critique(attempt.response, query)
                         if critique_result['needs_revision']:
                             logger.info("🔍 Self-critique detected issues, revising...")
                             if stream:
@@ -275,7 +275,7 @@ class ResonanceReasoner:
             if stream:
                 yield "\n\n❌ Error: No reasoning attempts completed. Please try again.\n"
 
-    def _self_critique(self, response: str, original_query: str) -> Dict:
+    async def _self_critique(self, response: str, original_query: str) -> Dict:
         """
         Validate reasoning for logical errors.
 
@@ -305,7 +305,7 @@ If the response is sound, respond with: "VALID"
 """
 
         critique_result = ""
-        for chunk in critique_wrapper.stream_chat(critique_prompt):
+        async for chunk in critique_wrapper.stream_chat(critique_prompt):
             critique_result += chunk
 
         if "ISSUE:" in critique_result:
