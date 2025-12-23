@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+chimera_resonance_final.py
+Closed-Loop Generation Governor (PLL-style) with Telemetry + Plot
+
+- Topic sensor: SentenceTransformer cosine(anchor, mean(last_k_chunk_embeddings))
+- Evidence sensor: context term support + unsupported novelty ratio
+- Controller: MAINTAIN / NUDGE / INTERVENE / REJECT
+- Harness: true closed-loop retry-on-reject, per-step acceptance, summary stats
+- Outputs: terminal log + resonance_demo.png (+ optional JSONL telemetry)
+
+Run:
+  python chimera_resonance_final.py --steps 40 --seed 42 --out resonance_demo.png
+
+Optional:
+  pip install sentence-transformers torch
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import re
+import sys
+from dataclasses import dataclass, asdict
+from enum import Enum
+from collections import Counter, deque
+from typing import Deque, List, Optional, Dict, Any, Tuple
+
+import numpy as np
+
+# Force headless-safe plotting (prevents Qt/Wayland noise)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+
+# -----------------------------
+# Logging
+# -----------------------------
+LOG_FORMAT = "[%(name)s] %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger("ChimeraResonance")
+
+
+# -----------------------------
+# Optional SentenceTransformers
+# -----------------------------
+try:
+    from sentence_transformers import SentenceTransformer
+    HAS_ST = True
+except Exception:
+    SentenceTransformer = None
+    HAS_ST = False
+    logger.warning("sentence-transformers not found. Using degraded topic sensor (keyword overlap).")
+
+
+# -----------------------------
+# Types
+# -----------------------------
+class ActionType(Enum):
+    MAINTAIN = "MAINTAIN"
+    NUDGE = "NUDGE"
+    INTERVENE = "INTERVENE"
+    REJECT = "REJECT"
+
+
+@dataclass(frozen=True)
+class Telemetry:
+    step: int
+    attempt: int
+    accepted: bool
+
+    topic_score: float
+    evidence_score: float
+    novelty_unsupported: float
+
+    drift: float
+    action: str
+    temperature: float
+    reason: str
+
+    chunk: str
+
+
+@dataclass(frozen=True)
+class ControlState:
+    action: ActionType
+    temperature: float
+    injection: Optional[str] = None
+    reason: str = ""
+
+
+@dataclass
+class ControllerConfig:
+    # Drift thresholds
+    drift_warn: float = 0.30
+    drift_reject: float = 0.60
+
+    # Evidence gating
+    evidence_threshold: float = 0.40        # below/eq => penalty
+    evidence_penalty: float = 0.30
+
+    # Unsupported novelty gating (kills “alien encryption key” style additions)
+    novelty_threshold: float = 0.15         # above => penalty
+    novelty_penalty: float = 0.30
+
+    # Actuation
+    base_temp: float = 0.70
+    nudge_temp: float = 0.20
+    reject_temp: float = 0.10
+
+    # Sensor window
+    embed_window: int = 5
+
+    # Operational safety
+    fail_closed: bool = True                # if topic sensor unavailable, be conservative
+
+    # Escalation behavior
+    intervene_after_consecutive_nudges: int = 1  # 1 means: second time in warning band -> INTERVENE
+
+    # Message injected on INTERVENE (keep it short, not mystical)
+    intervention_text: str = (
+        "\n[SYSTEM]: Stay strictly aligned with the provided context. "
+        "Do not introduce new entities/claims unless supported by context.\n"
+    )
+
+
+# -----------------------------
+# Sensors
+# -----------------------------
+_TOKEN_RE = re.compile(r"\b[a-z]{4,}\b", re.IGNORECASE)
+
+def tokenize_terms(text: str) -> set[str]:
+    return set(m.group(0).lower() for m in _TOKEN_RE.finditer(text))
+
+
+class SemanticSensor:
+    """
+    Topic alignment sensor.
+    - If ST available: cosine(anchor_vec, mean(last_k_chunk_vecs))
+    - Else: keyword overlap against anchor terms
+    """
+    def __init__(self, *, model_name: str, device: str, window: int):
+        self.window = int(window)
+        self.model = None
+        self.anchor_vec: Optional[np.ndarray] = None
+        self.anchor_terms: set[str] = set()
+        self.chunk_vecs: Deque[np.ndarray] = deque(maxlen=self.window)
+
+        if HAS_ST:
+            device = self._resolve_device(device)
+            try:
+                self.model = SentenceTransformer(model_name, device=device)
+                logger.info(f"Semantic sensor loaded on {device} ({model_name})")
+            except Exception as e:
+                logger.error(f"Failed to load SentenceTransformer: {e}")
+                self.model = None
+
+    @staticmethod
+    def _resolve_device(device: str) -> str:
+        if device != "cpu":
+            return device
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return "cuda"
+        except Exception:
+            pass
+        return "cpu"
+
+    def set_anchor(self, text: str) -> None:
+        text = text.strip()
+        self.anchor_terms = tokenize_terms(text)
+        self.chunk_vecs.clear()
+
+        if self.model is not None:
+            self.anchor_vec = self._embed(text)
+        else:
+            self.anchor_vec = None
+
+    def measure(self, chunk: str) -> Optional[float]:
+        chunk = chunk.strip()
+        if not chunk:
+            return 1.0
+
+        # Degraded mode (no ST)
+        if self.model is None or self.anchor_vec is None:
+            if not self.anchor_terms:
+                return None
+            terms = tokenize_terms(chunk)
+            if not terms:
+                return 0.0
+            overlap = len(terms & self.anchor_terms) / max(1, len(terms))
+            return float(np.clip(overlap, 0.0, 1.0))
+
+        # Embedding mode
+        v = self._embed(chunk)
+        self.chunk_vecs.append(v)
+
+        cur = np.mean(np.stack(self.chunk_vecs, axis=0), axis=0)
+        cur = cur / (np.linalg.norm(cur) + 1e-9)
+
+        score = float(np.dot(self.anchor_vec, cur))
+        return float(np.clip(score, -1.0, 1.0))
+
+    def _embed(self, text: str) -> np.ndarray:
+        # prevent progress-bar spam
+        vec = self.model.encode(text, convert_to_numpy=True, show_progress_bar=False)
+        return vec / (np.linalg.norm(vec) + 1e-9)
+
+
+class EvidenceVerifier:
+    """
+    Evidence sensor:
+      evidence_score = supported_terms / total_terms
+      novelty_unsupported = unsupported_terms / total_terms
+
+    This is deliberately simple and fast for a demo.
+    (For Chimera production: swap to retrieval-snippet embedding scoring.)
+    """
+    def __init__(self):
+        self.context_terms: set[str] = set()
+
+    def set_context(self, context: str) -> None:
+        self.context_terms = tokenize_terms(context)
+
+    def verify(self, chunk: str) -> Tuple[float, float]:
+        terms = tokenize_terms(chunk)
+        if not terms:
+            return 1.0, 0.0
+
+        supported = terms & self.context_terms
+        unsupported = terms - self.context_terms
+
+        evidence = len(supported) / len(terms)
+        novelty_unsupported = len(unsupported) / len(terms)
+        return float(evidence), float(novelty_unsupported)
+
+
+# -----------------------------
+# Controller (Governor)
+# -----------------------------
+class ResonanceController:
+    def __init__(
+        self,
+        config: ControllerConfig,
+        *,
+        model_name: str = "all-MiniLM-L6-v2",
+        device: str = "cpu",
+    ):
+        self.cfg = config
+        self.sensor = SemanticSensor(model_name=model_name, device=device, window=config.embed_window)
+        self.verifier = EvidenceVerifier()
+
+        self.step = 0
+        self.consecutive_nudges = 0
+
+    def set_ground_truth(self, context: str) -> None:
+        self.sensor.set_anchor(context)
+        self.verifier.set_context(context)
+        self.step = 0
+        self.consecutive_nudges = 0
+        logger.info("🌞 Anchor locked. Resonance controller active.")
+
+    def evaluate_chunk(self, chunk: str) -> Tuple[ControlState, Dict[str, float]]:
+        """
+        Returns:
+          ControlState + metrics dict {topic, evidence, novelty, drift}
+        """
+        topic = self.sensor.measure(chunk)
+        evid, novelty = self.verifier.verify(chunk)
+
+        # Topic missing => conservative behavior (fail-closed)
+        if topic is None:
+            topic = 0.0 if self.cfg.fail_closed else 0.5
+
+        # Base drift from topic
+        drift = 1.0 - float(np.clip(topic, -1.0, 1.0))
+
+        reason_bits: List[str] = []
+
+        # Evidence penalty (use <= so threshold is strict)
+        if evid <= self.cfg.evidence_threshold:
+            drift += self.cfg.evidence_penalty
+            reason_bits.append(f"low_evidence({evid:.2f})")
+
+        # Novelty penalty (kills “alien encryption key”)
+        if novelty > self.cfg.novelty_threshold:
+            drift += self.cfg.novelty_penalty
+            reason_bits.append(f"unsupported_novelty({novelty:.2f})")
+
+        drift = float(np.clip(drift, 0.0, 1.0))
+
+        # Decide action
+        action = ActionType.MAINTAIN
+        temp = self.cfg.base_temp
+        injection = None
+
+        if drift >= self.cfg.drift_reject:
+            action = ActionType.REJECT
+            temp = self.cfg.reject_temp
+            self.consecutive_nudges = 0
+            reason_bits.append(f"high_drift({drift:.2f})")
+
+        elif drift >= self.cfg.drift_warn:
+            # Warning band
+            self.consecutive_nudges += 1
+            temp = self.cfg.nudge_temp
+            reason_bits.append(f"drift_warn({drift:.2f})")
+
+            if self.consecutive_nudges > self.cfg.intervene_after_consecutive_nudges:
+                action = ActionType.INTERVENE
+                injection = self.cfg.intervention_text
+                reason_bits.append("escalate(nudge_failed)")
+            else:
+                action = ActionType.NUDGE
+
+        else:
+            # Stable band
+            action = ActionType.MAINTAIN
+            temp = self.cfg.base_temp
+            self.consecutive_nudges = 0
+
+        reason = ", ".join(reason_bits) if reason_bits else "ok"
+        return ControlState(action=action, temperature=temp, injection=injection, reason=reason), {
+            "topic": float(topic),
+            "evidence": float(evid),
+            "novelty": float(novelty),
+            "drift": float(drift),
+        }
+
+
+# -----------------------------
+# Demo “Plant” (simulated generator)
+# -----------------------------
+GOOD = [
+    "The Kuramoto model studies synchronization of coupled oscillators.",
+    "It uses natural frequencies and a coupling constant K.",
+    "As K increases, oscillators can phase-lock and synchronize.",
+    "It is used to model collective behavior in biological systems like fireflies and heart cells.",
+    "Phase locking emerges when coupling overcomes frequency dispersion."
+]
+BAD = [
+    "Fireflies use this math to talk to government drones.",
+    "The drones are piloted by microscopic pizza chefs.",
+    "A black-ops agency controls the oscillators with secret antennas.",
+    "The coupling constant K is actually an alien encryption key.",
+    "Omega is a hidden codeword for interstellar surveillance."
+]
+
+def simulated_candidate(rng: np.random.Generator, step: int, base_p_drift: float) -> str:
+    # drift probability slowly increases with time
+    p = float(np.clip(base_p_drift + 0.01 * step, 0.0, 0.95))
+    return rng.choice(BAD) if (rng.random() < p) else rng.choice(GOOD)
+
+
+# -----------------------------
+# Plotting
+# -----------------------------
+def plot_telemetry(history: List[Telemetry], out_png: str, cfg: ControllerConfig) -> None:
+    steps = [t.step for t in history]
+    topic = [t.topic_score for t in history]
+    evid = [t.evidence_score for t in history]
+    nov = [t.novelty_unsupported for t in history]
+    drift = [t.drift for t in history]
+
+    plt.figure(figsize=(13, 6))
+    plt.plot(steps, topic, label="Topic score")
+    plt.plot(steps, evid, label="Evidence score")
+    plt.plot(steps, nov, label="Unsupported novelty")
+    plt.plot(steps, drift, label="Drift (topic + penalties)")
+
+    # thresholds
+    plt.axhline(cfg.drift_warn, linestyle="--", alpha=0.4, label="Drift warn threshold")
+    plt.axhline(cfg.drift_reject, linestyle="--", alpha=0.4, label="Drift reject threshold")
+
+    # markers by action (accepted only)
+    for t in history:
+        if not t.accepted:
+            continue
+        if t.action == ActionType.REJECT.value:
+            plt.scatter([t.step], [t.drift], marker="x", s=70)
+        elif t.action == ActionType.INTERVENE.value:
+            plt.scatter([t.step], [t.drift], marker="*", s=90)
+        elif t.action == ActionType.NUDGE.value:
+            plt.scatter([t.step], [t.drift], marker="o", s=25)
+
+    plt.ylim(-0.05, 1.05)
+    plt.xlabel("Step")
+    plt.ylabel("Score")
+    plt.title("Closed-Loop Resonance Governor Telemetry (PLL-style)")
+    plt.grid(True, alpha=0.25)
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(out_png, dpi=200)
+    logger.info(f"Saved plot: {out_png}")
+
+
+# -----------------------------
+# Main demo loop (true closed-loop)
+# -----------------------------
+def run_demo(
+    *,
+    steps: int,
+    seed: int,
+    base_p_drift: float,
+    max_retries: int,
+    out_png: str,
+    out_jsonl: Optional[str],
+    device: str,
+) -> None:
+    rng = np.random.default_rng(seed)
+
+    anchor = (
+        "The Kuramoto model describes synchronization of coupled oscillators. "
+        "It uses natural frequencies omega and a coupling constant K. "
+        "As coupling increases, phase locking can occur. "
+        "Applications include biological synchronization such as fireflies and heart cells."
+    )
+
+    cfg = ControllerConfig()
+    controller = ResonanceController(cfg, device=device)
+    controller.set_ground_truth(anchor)
+
+    print("\n--- 🟢 Starting Chimera Resonance Loop (Closed-Loop) ---\n")
+    print(f"🌞 Anchor: {anchor}\n")
+    if not HAS_ST:
+        print("⚠️ NOTE: sentence-transformers missing → degraded topic sensor (keyword overlap).")
+        print("   Install: pip install sentence-transformers torch\n")
+
+    history: List[Telemetry] = []
+    accepted_chunks: List[str] = []
+
+    jsonl_f = open(out_jsonl, "w", encoding="utf-8") if out_jsonl else None
+
+    def emit(t: Telemetry) -> None:
+        history.append(t)
+        if jsonl_f:
+            jsonl_f.write(json.dumps(asdict(t), ensure_ascii=False) + "\n")
+
+    for step in range(1, steps + 1):
+        attempt = 0
+        injection_accum = ""
+        temp = cfg.base_temp
+
+        while True:
+            attempt += 1
+            candidate = simulated_candidate(rng, step=step, base_p_drift=base_p_drift)
+
+            # apply injection text as “control input” (for a real LLM this would alter prompt)
+            if injection_accum:
+                candidate_for_eval = injection_accum + candidate
+            else:
+                candidate_for_eval = candidate
+
+            state, m = controller.evaluate_chunk(candidate_for_eval)
+
+            # terminal output
+            icon = {
+                ActionType.MAINTAIN: "🟢",
+                ActionType.NUDGE: "🟠",
+                ActionType.INTERVENE: "⚠️",
+                ActionType.REJECT: "🛑",
+            }[state.action]
+
+            accepted = (state.action != ActionType.REJECT) or (attempt > max_retries)
+
+            # record telemetry for this attempt (even if rejected)
+            emit(Telemetry(
+                step=step,
+                attempt=attempt,
+                accepted=accepted and (state.action != ActionType.REJECT),
+                topic_score=m["topic"],
+                evidence_score=m["evidence"],
+                novelty_unsupported=m["novelty"],
+                drift=m["drift"],
+                action=state.action.value,
+                temperature=state.temperature,
+                reason=state.reason,
+                chunk=candidate,
+            ))
+
+            print(f"[Step {step:02d} | Try {attempt}] {candidate}")
+            print(f"   -> Topic={m['topic']:.2f} | Evid={m['evidence']:.2f} | Novel={m['novelty']:.2f} | Drift={m['drift']:.2f}")
+            print(f"   {icon} ACTION={state.action.value} | temp={state.temperature:.2f} | reason={state.reason}")
+
+            # Closed-loop actuation
+            if state.action == ActionType.REJECT:
+                # Retry if possible
+                if attempt <= max_retries:
+                    temp = state.temperature  # for real LLM: lower temp on retry
+                    # optional: on repeated rejects, we can also inject
+                    # (kept minimal here)
+                    print(f"      ↻ REJECTED → retrying (temp={temp:.2f})\n")
+                    continue
+                else:
+                    # Too many rejects: accept nothing for this step, but move on
+                    print("      ✖ Max retries exceeded → skipping step\n")
+                    break
+
+            if state.action == ActionType.INTERVENE and state.injection:
+                injection_accum += state.injection
+
+            # Accept the candidate (in real LLM: append to prompt/state)
+            accepted_chunks.append(candidate)
+            print("      ✓ Accepted\n")
+            break
+
+    if jsonl_f:
+        jsonl_f.close()
+        logger.info(f"Saved telemetry JSONL: {out_jsonl}")
+
+    # Summary stats
+    counts = Counter(t.action for t in history)
+    total = len(history)
+    print("\n--- Summary (all attempts) ---")
+    for k in [a.value for a in ActionType]:
+        v = counts.get(k, 0)
+        print(f"{k:10s}: {v:4d} ({(v/total if total else 0):.1%})")
+    print(f"Total attempts: {total} | Steps: {steps} | Max retries/step: {max_retries}")
+
+    # Plot telemetry (use only first attempt per step or all attempts? Here: all attempts)
+    plot_telemetry(history, out_png, cfg)
+
+    # Show accepted stream snippet for Discord
+    print("\n--- Accepted stream (first ~6 lines) ---")
+    for line in accepted_chunks[:6]:
+        print(f"• {line}")
+
+    print(f"\nDone. Attach `{out_png}` (and terminal output) in Discord.")
+
+
+def parse_args(argv: List[str]) -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Closed-Loop Resonance Governor Demo (final)")
+    p.add_argument("--steps", type=int, default=40)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--p_drift", type=float, default=0.25, help="Base drift probability per step (simulated plant)")
+    p.add_argument("--max_retries", type=int, default=2, help="Reject retries per step before skipping")
+    p.add_argument("--out", type=str, default="resonance_demo.png", help="Output plot filename")
+    p.add_argument("--jsonl", type=str, default="", help="Optional telemetry JSONL output path")
+    p.add_argument("--device", type=str, default="cpu", help="cpu|cuda (auto-upgrades to cuda if available)")
+    return p.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args(sys.argv[1:])
+    run_demo(
+        steps=args.steps,
+        seed=args.seed,
+        base_p_drift=args.p_drift,
+        max_retries=args.max_retries,
+        out_png=args.out,
+        out_jsonl=(args.jsonl.strip() or None),
+        device=args.device,
+    )
