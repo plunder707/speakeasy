@@ -16,6 +16,7 @@ import logging
 import re
 import json
 import time
+from contextlib import aclosing
 from typing import Generator, List, Dict, AsyncGenerator
 
 try:
@@ -355,144 +356,145 @@ class OllamaResonanceWrapper:
 
             logger.info(f"Starting stream from {self.model}...")
 
-            async for chunk in stream:
-                chunk_count += 1
+            async with aclosing(stream) as stream_ctx:
+                async for chunk in stream_ctx:
+                    chunk_count += 1
 
-                # Handle different response formats (llama3 vs deepseek-r1)
-                try:
-                    # Ollama returns ChatResponse objects with .message attribute
-                    if hasattr(chunk, 'message'):
-                        msg = chunk.message
-                        
-                        # Manual Tag Detection & Routing ---
-                        raw_content = getattr(msg, 'content', '') or ''
-                        
-                        # Check for tags in the raw content stream
-                        if "<think>" in raw_content:
-                            self._in_thinking_block = True
-                            raw_content = raw_content.replace("<think>", "")
+                    # Handle different response formats (llama3 vs deepseek-r1)
+                    try:
+                        # Ollama returns ChatResponse objects with .message attribute
+                        if hasattr(chunk, 'message'):
+                            msg = chunk.message
 
-                        if "</think>" in raw_content:
-                            self._in_thinking_block = False
-                            raw_content = raw_content.replace("</think>", "")
+                            # Manual Tag Detection & Routing ---
+                            raw_content = getattr(msg, 'content', '') or ''
 
-                        # Route content based on state so existing formatting logic works
-                        if hasattr(self, '_in_thinking_block') and self._in_thinking_block:
-                            thinking_text = raw_content
-                            content_text = ""
-                        else:
-                            thinking_text = ""
-                            content_text = raw_content
+                            # Check for tags in the raw content stream
+                            if "<think>" in raw_content:
+                                self._in_thinking_block = True
+                                raw_content = raw_content.replace("<think>", "")
 
-                        # Format thinking as indented/collapsible (blockquote style)
-                        if thinking_text:
-                            text = thinking_text
-                            if not hasattr(self, '_in_thinking_block_header_sent'):
-                                self._in_thinking_block_header_sent = True
-                                text = "\n\n**💭 Thinking:**\n" + text
+                            if "</think>" in raw_content:
+                                self._in_thinking_block = False
+                                raw_content = raw_content.replace("</think>", "")
+
+                            # Route content based on state so existing formatting logic works
+                            if hasattr(self, '_in_thinking_block') and self._in_thinking_block:
+                                thinking_text = raw_content
+                                content_text = ""
                             else:
-                                text = text
-                                
-                        elif content_text:
-                             # Close thinking block if transitioning to content
-                            if hasattr(self, '_in_thinking_block_header_sent') and self._in_thinking_block_header_sent:
-                                self._in_thinking_block_header_sent = False
-                                text = "\n\n**Answer:**\n" + content_text
+                                thinking_text = ""
+                                content_text = raw_content
+
+                            # Format thinking as indented/collapsible (blockquote style)
+                            if thinking_text:
+                                text = thinking_text
+                                if not hasattr(self, '_in_thinking_block_header_sent'):
+                                    self._in_thinking_block_header_sent = True
+                                    text = "\n\n**💭 Thinking:**\n" + text
+                                else:
+                                    text = text
+
+                            elif content_text:
+                                 # Close thinking block if transitioning to content
+                                if hasattr(self, '_in_thinking_block_header_sent') and self._in_thinking_block_header_sent:
+                                    self._in_thinking_block_header_sent = False
+                                    text = "\n\n**Answer:**\n" + content_text
+                                else:
+                                    text = content_text
                             else:
-                                text = content_text
+                                text = ''
+
+                            if text:
+                                token_buffer += text
                         else:
-                            text = ''
-                        
-                        if text:
-                            token_buffer += text
-                    else:
-                        logger.warning(f"Unexpected chunk type: {type(chunk)}")
+                            logger.warning(f"Unexpected chunk type: {type(chunk)}")
+                            continue
+                    except (KeyError, TypeError, AttributeError) as e:
+                        import traceback
+                        logger.error(f"ERROR in chunk processing:")
+                        logger.error(f"  Exception: {e}")
+                        logger.error(f"  Chunk type: {type(chunk)}")
+                        logger.error(f"  Chunk value: {chunk}")
+                        logger.error(f"  Traceback: {traceback.format_exc()}")
                         continue
-                except (KeyError, TypeError, AttributeError) as e:
-                    import traceback
-                    logger.error(f"ERROR in chunk processing:")
-                    logger.error(f"  Exception: {e}")
-                    logger.error(f"  Chunk type: {type(chunk)}")
-                    logger.error(f"  Chunk value: {chunk}")
-                    logger.error(f"  Traceback: {traceback.format_exc()}")
-                    continue
 
-                clean_chunk = trim_overlap(token_buffer, accepted_text)
-                if not clean_chunk:
-                    continue
+                    clean_chunk = trim_overlap(token_buffer, accepted_text)
+                    if not clean_chunk:
+                        continue
 
-                if is_boilerplate(token_buffer):
-                    token_buffer = ""
-                    continue
+                    if is_boilerplate(token_buffer):
+                        token_buffer = ""
+                        continue
 
-                if "\n" in token_buffer and looks_like_header(token_buffer):
+                    if "\n" in token_buffer and looks_like_header(token_buffer):
+                        to_yield = trim_overlap(token_buffer, accepted_text)
+                        if to_yield:
+                            yield to_yield
+                            accepted_text += to_yield
+                            self.history.append({"role": "assistant", "content": to_yield})
+                        token_buffer = ""
+                        continue
+
+                    if not should_evaluate(token_buffer):
+                        continue
+
+                    # Skip drift evaluation for DeepSeek-R1 "thinking" blocks
+                    # Thinking uses different vocabulary than sources (meta-reasoning vs content)
+                    # Only evaluate drift on the actual "content" output
+                    if hasattr(self, '_in_thinking_block') and self._in_thinking_block:
+                        # Don't evaluate thinking - just yield it
+                        to_yield = trim_overlap(token_buffer, accepted_text)
+                        if to_yield:
+                            yield to_yield
+                            accepted_text += to_yield
+                        token_buffer = ""
+                        continue
+
+                    step_count += 1
+                    state, metrics = self.controller.evaluate_chunk(token_buffer)
+
+                    # Update current drift for real-time TUI tracking
+                    self.current_drift = float(metrics['drift'])
+
+                    # Telemetry
+                    telemetry_data.append({
+                        "step": step_count,
+                        "drift": float(metrics['drift']),
+                        "action": state.action.name,
+                        "chunk": token_buffer.strip()[:50] + "..."
+                    })
+
+                    if state.action == ActionType.REJECT:
+                        logger.warning(f"REJECT: Drift={metrics['drift']:.2f}, Evidence={metrics['evidence']:.2f}")
+                        retries += 1
+                        if retries >= MAX_RETRIES:
+                            if is_reasoning_model:
+                                # For reasoning models, this is expected - multi-path will try different approach
+                                logger.info(f"Path diverged from sources (drift={metrics['drift']:.2f}), trying alternative approach")
+                                return  # Exit cleanly without error message
+                            else:
+                                # For regular models, this is a failure
+                                yield "\n[System: Resonance Failure - Maximum correction attempts exceeded]\n"
+                                return
+
+                        current_temp = state.temperature
+                        injection = "Correct the previous response to align with the context. Continue."
+                        token_buffer = ""
+                        break
+
+                    # Accept
+                    retries = 0
+                    injection = None
+                    current_temp = state.temperature
+
                     to_yield = trim_overlap(token_buffer, accepted_text)
                     if to_yield:
                         yield to_yield
                         accepted_text += to_yield
+                        accepted_chunks.append(to_yield)  # Track for repetition
                         self.history.append({"role": "assistant", "content": to_yield})
                     token_buffer = ""
-                    continue
-
-                if not should_evaluate(token_buffer):
-                    continue
-
-                # Skip drift evaluation for DeepSeek-R1 "thinking" blocks
-                # Thinking uses different vocabulary than sources (meta-reasoning vs content)
-                # Only evaluate drift on the actual "content" output
-                if hasattr(self, '_in_thinking_block') and self._in_thinking_block:
-                    # Don't evaluate thinking - just yield it
-                    to_yield = trim_overlap(token_buffer, accepted_text)
-                    if to_yield:
-                        yield to_yield
-                        accepted_text += to_yield
-                    token_buffer = ""
-                    continue
-
-                step_count += 1
-                state, metrics = self.controller.evaluate_chunk(token_buffer)
-
-                # Update current drift for real-time TUI tracking
-                self.current_drift = float(metrics['drift'])
-
-                # Telemetry
-                telemetry_data.append({
-                    "step": step_count,
-                    "drift": float(metrics['drift']),
-                    "action": state.action.name,
-                    "chunk": token_buffer.strip()[:50] + "..."
-                })
-
-                if state.action == ActionType.REJECT:
-                    logger.warning(f"REJECT: Drift={metrics['drift']:.2f}, Evidence={metrics['evidence']:.2f}")
-                    retries += 1
-                    if retries >= MAX_RETRIES:
-                        if is_reasoning_model:
-                            # For reasoning models, this is expected - multi-path will try different approach
-                            logger.info(f"Path diverged from sources (drift={metrics['drift']:.2f}), trying alternative approach")
-                            return  # Exit cleanly without error message
-                        else:
-                            # For regular models, this is a failure
-                            yield "\n[System: Resonance Failure - Maximum correction attempts exceeded]\n"
-                            return
-
-                    current_temp = state.temperature
-                    injection = "Correct the previous response to align with the context. Continue."
-                    token_buffer = ""
-                    break
-
-                # Accept
-                retries = 0
-                injection = None
-                current_temp = state.temperature
-
-                to_yield = trim_overlap(token_buffer, accepted_text)
-                if to_yield:
-                    yield to_yield
-                    accepted_text += to_yield
-                    accepted_chunks.append(to_yield)  # Track for repetition
-                    self.history.append({"role": "assistant", "content": to_yield})
-                token_buffer = ""
 
             # Stream has finished - mark it regardless of buffer content
             logger.info(f"Stream finished. Received {chunk_count} chunks total.")
